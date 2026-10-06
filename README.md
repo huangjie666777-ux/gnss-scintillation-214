@@ -10,10 +10,14 @@
 - /reflectometry — 单频（S1C，L1 C/A 信噪比）GNSS-IR 反射测高：
   由干涉振荡反演天线相位中心下方反射面高度 H，结合天线相位中心相对
   水尺零点高程 Z 输出水位 Z - H。
+- /scintillation — GPS L1 闪烁监测：50 Hz（INTERVAL 0.02 s）S1C+L1C
+  输入，逐星质量控制分弧、六阶 0.1 Hz Butterworth 高通滤波，按 GPS
+  整分 60 秒半开窗输出 S4 与 sigma_phi（rad）。仅需 RINEX，无需 SP3。
 
 ## 环境
 
-- Python 3.10.12 / FastAPI 0.115.12 / NumPy 2.2.6（全部在 .venv 中）
+- Python 3.10.12 / FastAPI 0.115.12 / NumPy 2.2.6 / SciPy 1.15.3
+  （全部在 .venv 中）
 
 ## 运行
 
@@ -43,6 +47,11 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 
 合成样例真值：H=3.6 m、Z=12.0 m，已知水位 8.4 m。
 
+闪烁监测（仅需 RINEX；头部须声明 S1C、L1C 与 INTERVAL 0.02 s，
+最多 18000 历元、4 颗 GPS 卫星）：
+
+    curl -s -F "rinex=@examples/obs_scint.rnx" +         http://127.0.0.1:8000/scintillation | python3 -m json.tool
+
 返回每个历元：状态与失败原因、ECEF 米坐标、WGS84 经纬度与椭球高、
 接收机钟差（秒）、使用/排除的卫星（含排除原因）、逐星残差（米）与 RMS。
 
@@ -50,6 +59,7 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 
     .venv/bin/python examples/make_synthetic.py   # 写 examples/obs.rnx, examples/eph.sp3
     .venv/bin/python examples/make_reflect.py     # 写 examples/obs_reflect.rnx（仅 S1C）
+    .venv/bin/python examples/make_scint.py       # 写 examples/obs_scint.rnx（50 Hz S1C+L1C）
 
 ## 测试
 
@@ -63,6 +73,8 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 - 按头部观测类型顺序解析固定宽度字段，兼容 SYS / # / OBS TYPES 续行；
   空白或零伪距视为缺测。
 - 校验日期、卫星身份、历元数量（上限 100）、非有限值与截断。
+- 历元数量上限按接口区分：定位/TEC/测高沿用 100 历元；闪烁监测
+  放宽到 18000 历元、至多 4 颗 GPS 卫星。
 - SP3：位置 km→m，钟差 µs→s；零坐标与 999999.999999 缺失钟差被识别。
 - 卫星位置用连续 8 节点 Lagrange 插值，钟差用相邻节点线性插值；
   不跨缺测节点、不外推，不可用的卫星给出排除原因。
@@ -120,6 +132,30 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 - 输出：逐星逐历元记录（状态与排除原因、仰角、S1C）及逐弧结果
   （起止时间、升/落方向、样本来源 S1C 与样本列表、反射高度 H、
   水位 Z-H、幅值、残差 RMS、RSS 高度曲线与警告）。
+- 高度搜索网格对浮点取整留 1e-9 相对容差，合法上界（恰为步长整数倍
+  的 h_max）不再因 (h_max-h_min)/h_step 的舍入误差被漏扫。
+
+## 闪烁监测解算规则
+
+- 输入门槛：RINEX 3.04、GPS 时间、正常历元；头部必须声明 S1C 与 L1C
+  （可仅这两类）且 INTERVAL 为 0.02 s（容差 1 us）；历元时刻严格递增，
+  相邻时差须为 0.02 s 的整数倍（容差 1 us），否则整文件拒绝。
+- 逐星质量控制：缺 S1C 或 L1C、L1C 的 LLI 非零的历元标 excluded 并
+  保留原因；异常点与超过一个采样间隔的时间缺口均断弧；不补样、
+  不插值。
+- 相位处理：L1C 为连续相位周数，不取模、不 unwrap；每弧减去弧首
+  相位后乘 2π 转弧度；六阶 0.1 Hz Butterworth 高通以 SOS 因果形式
+  过滤、零初态，弧间重置状态，弧内跨分钟连续。
+- 窗口交付：按 GPS 整分取 60 秒半开窗 [t, t+60 s)；窗内满 3000 点、
+  同属一条弧且窗口起点距弧起点至少 60 s（滤波热身）才有效；缺测、
+  尾窗、跨弧与热身不足的窗口均返回 failed 并注明原因。
+- 指标：强度 I = 10^(S1C/10)，S4 = std(I)/mean(I)；sigma_phi 为窗内
+  滤后相位的总体标准差（rad）。两者均为总体标准差（ddof=0）。
+- 未作噪声修正：S4 与 sigma_phi 未扣除接收机噪声基底，指标偏高
+  不自动认定为电离层闪烁或接收机故障，需结合其他信息判读。
+- 输出：逐星逐历元记录（状态与排除原因、S1C、L1C、弧编号）、逐弧
+  信息（起止时间、样本数）及逐窗结果（窗口起点、状态与失败原因、
+  弧编号、样本数、S4、sigma_phi_rad）。
 
 ## 模块划分
 
@@ -130,5 +166,7 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 - gnss_scint214/tec.py — 双频几何无关组合、分弧定级、薄壳映射与穿刺点
 - gnss_scint214/reflect.py — S1C 反射测高：ENU 仰角过滤、单调分弧、
   去趋势与网格搜索反演
+- gnss_scint214/scint.py — 闪烁监测：历元网格校验、质量分弧、SOS 高通
+  滤波与整分窗口指标
 - gnss_scint214/geodesy.py — WGS84 坐标转换与常数
 - gnss_scint214/main.py — FastAPI 入口

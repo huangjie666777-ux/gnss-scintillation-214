@@ -184,8 +184,15 @@ def _invert_arc(arc: list[_Sample], h_grid: np.ndarray) -> dict:
 
 
 def build_grid(h_min: float, h_max: float, h_step: float) -> np.ndarray:
-    n = int(math.floor((h_max - h_min) / h_step)) + 1
-    return h_min + h_step * np.arange(n)
+    # tolerate floating-point rounding so a legal upper bound that is an
+    # exact multiple of the step (e.g. (2.5-0.5)/0.1 = 19.999...999) is
+    # not silently dropped from the search grid
+    quotient = (h_max - h_min) / h_step
+    n = int(math.floor(quotient + 1e-9)) + 1
+    grid = h_min + h_step * np.arange(n)
+    if abs(grid[-1] - h_max) <= 1e-9 * max(1.0, abs(h_max)):
+        grid[-1] = h_max
+    return grid
 
 
 def compute_reflectometry(obs: RinexData, sp3: Sp3Data,

@@ -1,5 +1,6 @@
-"""FastAPI entry point: RINEX 3.04 + SP3-c positioning, GPS dual-band TEC
-and single-frequency (S1C) GNSS-IR water-level reflectometry."""
+"""FastAPI entry point: RINEX 3.04 + SP3-c positioning, GPS dual-band TEC,
+single-frequency (S1C) GNSS-IR water-level reflectometry and 50 Hz GPS L1
+scintillation monitoring (S4 / sigma_phi)."""
 
 from __future__ import annotations
 
@@ -12,12 +13,15 @@ from .errors import GnssError
 from .geodesy import geodetic_to_ecef
 from .reflect import MAX_GRID_POINTS, SNR_OBS, build_grid, compute_reflectometry
 from .rinex import RinexData, parse_rinex
+from .scint import MAX_EPOCHS as SCINT_MAX_EPOCHS
+from .scint import REQUIRED_OBS as SCINT_REQUIRED_OBS
+from .scint import compute_scintillation
 from .solver import solve_all
 from .sp3 import Sp3Data, parse_sp3
 from .tec import REQUIRED_OBS, compute_tec
 
 app = FastAPI(title="GNSS Positioning + Ionosphere TEC + Reflectometry",
-              version="0.3.0")
+              version="0.4.0")
 
 
 async def _read_inputs(rinex: UploadFile, sp3: UploadFile) -> tuple[RinexData, Sp3Data]:
@@ -215,3 +219,32 @@ async def reflectometry(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/scintillation")
+async def scintillation(rinex: UploadFile = File(...)):
+    """GPS L1 scintillation monitoring (S4, sigma_phi) from 50 Hz S1C+L1C.
+
+    RINEX 3.04, GPS time, normal epochs only; the header must declare S1C
+    and L1C (other types allowed) and INTERVAL 0.02 s. At most 18000
+    epochs and 4 GPS satellites. No SP3 needed.
+    """
+    if rinex.filename and rinex.filename.endswith((".gz", ".zip", ".Z")):
+        raise HTTPException(400, "compressed RINEX not accepted; upload uncompressed file")
+    try:
+        rinex_text = (await rinex.read()).decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "rinex: file is not plain ASCII text")
+    try:
+        obs = parse_rinex(rinex_text, max_epochs=SCINT_MAX_EPOCHS)
+    except GnssError as e:
+        raise HTTPException(422, f"RINEX rejected: {e}")
+    missing_types = [t for t in SCINT_REQUIRED_OBS if t not in obs.obs_types_gps]
+    if missing_types:
+        raise HTTPException(
+            422, f"RINEX rejected: obs type(s) {missing_types} required for "
+                 "scintillation monitoring not declared in header")
+    try:
+        return compute_scintillation(obs)
+    except GnssError as e:
+        raise HTTPException(422, f"RINEX rejected: {e}")

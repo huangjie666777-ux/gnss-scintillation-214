@@ -32,6 +32,7 @@ class RinexData:
     epochs: list[EpochObs]
     approx_position: tuple[float, float, float] | None
     obs_types_gps: list[str]
+    interval_s: float | None = None
 
 
 def _parse_float_field(text: str, file: str, line: int) -> float | None:
@@ -63,7 +64,7 @@ def _parse_header(lines: list[str]) -> tuple[dict, int]:
     raise RinexParseError("END OF HEADER not found (file truncated)", FILE, len(lines))
 
 
-def parse_rinex(text: str) -> RinexData:
+def parse_rinex(text: str, max_epochs: int = MAX_EPOCHS) -> RinexData:
     lines = text.splitlines()
     if not lines:
         raise RinexParseError("empty file", FILE, 0)
@@ -142,6 +143,17 @@ def parse_rinex(text: str) -> RinexData:
         except ValueError:
             raise RinexParseError("bad APPROX POSITION XYZ", FILE, aln)
 
+    # --- nominal epoch interval (optional header) ---
+    interval_s: float | None = None
+    if "INTERVAL" in header:
+        iline, iln = header["INTERVAL"][0]
+        try:
+            interval_s = float(iline[0:10])
+        except ValueError:
+            raise RinexParseError("bad INTERVAL value", FILE, iln)
+        if not (interval_s > 0.0):
+            raise RinexParseError("INTERVAL must be positive", FILE, iln)
+
     # --- epoch records ---
     epochs: list[EpochObs] = []
     i = n_header  # 0-based index of first data line
@@ -211,9 +223,10 @@ def parse_rinex(text: str) -> RinexData:
                 obs.pseudoranges[prn.strip()] = sat_obs["C1C"][0]
             i += 1
         epochs.append(obs)
-        if len(epochs) > MAX_EPOCHS:
+        if len(epochs) > max_epochs:
             raise RejectedContentError(
-                f"more than {MAX_EPOCHS} epochs not supported", FILE, ln)
+                f"more than {max_epochs} epochs not supported", FILE, ln)
     if not epochs:
         raise RinexParseError("no epochs found", FILE, len(lines))
-    return RinexData(epochs=epochs, approx_position=approx, obs_types_gps=obs_types)
+    return RinexData(epochs=epochs, approx_position=approx,
+                     obs_types_gps=obs_types, interval_s=interval_s)
