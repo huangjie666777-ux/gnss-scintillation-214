@@ -12,6 +12,8 @@ from .errors import GnssError
 from .geodesy import geodetic_to_ecef
 from .reflect import MAX_GRID_POINTS, SNR_OBS, build_grid, compute_reflectometry
 from .rinex import RinexData, parse_rinex
+from .scintillation import REQUIRED_OBS as SCINT_REQUIRED_OBS
+from .scintillation import compute_scintillation
 from .solver import solve_all
 from .sp3 import Sp3Data, parse_sp3
 from .tec import REQUIRED_OBS, compute_tec
@@ -40,6 +42,20 @@ async def _read_inputs(rinex: UploadFile, sp3: UploadFile) -> tuple[RinexData, S
     except GnssError as e:
         raise HTTPException(422, f"SP3 rejected: {e}")
     return obs, eph
+
+
+async def _read_rinex(rinex: UploadFile,
+                      strict_scintillation: bool = False) -> RinexData:
+    if rinex.filename and rinex.filename.endswith((".gz", ".zip", ".Z")):
+        raise HTTPException(400, "compressed RINEX not accepted; upload uncompressed file")
+    try:
+        rinex_text = (await rinex.read()).decode("ascii")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "rinex: file is not plain ASCII text")
+    try:
+        return parse_rinex(rinex_text, strict_scintillation=strict_scintillation)
+    except GnssError as e:
+        raise HTTPException(422, f"RINEX rejected: {e}")
 
 
 @app.post("/position")
@@ -208,6 +224,32 @@ async def reflectometry(
         "rising/setting reversals and any filtered epoch; arcs need "
         ">=12 points and >=5 deg elevation span.",
         "water_level_m = antenna_height_m - reflector_height_m.",
+    ]
+    return result
+
+
+@app.post("/scintillation")
+async def scintillation(rinex: UploadFile = File(...)):
+    """GPS L1 amplitude/phase scintillation indices from S1C and L1C."""
+    obs = await _read_rinex(rinex, strict_scintillation=True)
+    missing_types = [name for name in SCINT_REQUIRED_OBS
+                     if name not in obs.obs_types_gps]
+    if missing_types:
+        raise HTTPException(422, "RINEX rejected: obs type(s) "
+                                 f"{missing_types} required for scintillation "
+                                 "not declared in header")
+    result = compute_scintillation(obs)
+    result["notes"] = [
+        "S1C is converted to intensity as 10^(S1C/10); S4 is population "
+        "standard deviation divided by the mean within a 60 s window.",
+        "L1C continuous phase cycles are neither reduced modulo one cycle "
+        "nor unwrapped; each arc is reduced by its first phase and converted "
+        "to radians.",
+        "A sixth-order causal 0.1 Hz Butterworth SOS high-pass filter starts "
+        "from zero state for every arc; missing samples and LLI breaks reset "
+        "the arc and state.",
+        "Indices are raw monitoring quantities without noise correction and "
+        "do not automatically classify a receiver or signal as faulty.",
     ]
     return result
 

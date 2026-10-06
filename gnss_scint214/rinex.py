@@ -16,6 +16,10 @@ from .errors import RejectedContentError, RinexParseError
 
 FILE = "rinex"
 MAX_EPOCHS = 100
+SCINTILLATION_MAX_EPOCHS = 18000
+SCINTILLATION_MAX_SATELLITES = 4
+SCINTILLATION_INTERVAL_S = 0.02
+TIME_TOLERANCE_S = 1e-6
 
 
 @dataclass
@@ -63,7 +67,7 @@ def _parse_header(lines: list[str]) -> tuple[dict, int]:
     raise RinexParseError("END OF HEADER not found (file truncated)", FILE, len(lines))
 
 
-def parse_rinex(text: str) -> RinexData:
+def parse_rinex(text: str, strict_scintillation: bool = False) -> RinexData:
     lines = text.splitlines()
     if not lines:
         raise RinexParseError("empty file", FILE, 0)
@@ -84,10 +88,27 @@ def parse_rinex(text: str) -> RinexData:
 
     # --- TIME OF FIRST OBS must be GPS ---
     tobs = header.get("TIME OF FIRST OBS")
-    if tobs:
+    if tobs is not None:
         tline, tln = tobs[0]
         if tline[48:60].strip() != "GPS":
             raise RejectedContentError("only GPS time system supported", FILE, tln)
+    elif strict_scintillation:
+        raise RejectedContentError("TIME OF FIRST OBS GPS header is required", FILE, 0)
+
+    interval_s = None
+    if "INTERVAL" in header:
+        iline, iln = header["INTERVAL"][0]
+        try:
+            interval_s = float(iline[0:10])
+        except ValueError:
+            raise RinexParseError("bad INTERVAL value", FILE, iln)
+    if strict_scintillation:
+        if interval_s is None:
+            raise RejectedContentError("INTERVAL header is required", FILE, 0)
+        if abs(interval_s - SCINTILLATION_INTERVAL_S) > TIME_TOLERANCE_S:
+            raise RejectedContentError(
+                f"INTERVAL must be {SCINTILLATION_INTERVAL_S:.2f} s for "
+                f"scintillation monitoring, got {interval_s}", FILE, iln)
 
     # --- reject receiver clock offset pre-applied ---
     for key in ("RCV CLOCK OFFS APPL", "LEAP SECONDS"):
@@ -172,7 +193,9 @@ def parse_rinex(text: str) -> RinexData:
                             int(round((sec - whole) * 1e6)), tzinfo=dt.timezone.utc)
         except ValueError as e:
             raise RinexParseError(f"invalid epoch date: {e}", FILE, ln)
-        if n_sat < 0 or n_sat > 64:
+        max_sats = (SCINTILLATION_MAX_SATELLITES
+                    if strict_scintillation else 64)
+        if n_sat < 0 or n_sat > max_sats:
             raise RinexParseError(f"implausible satellite count {n_sat}", FILE, ln)
         i += 1
         obs = EpochObs(time=t)
@@ -211,9 +234,32 @@ def parse_rinex(text: str) -> RinexData:
                 obs.pseudoranges[prn.strip()] = sat_obs["C1C"][0]
             i += 1
         epochs.append(obs)
-        if len(epochs) > MAX_EPOCHS:
+        epoch_limit = (SCINTILLATION_MAX_EPOCHS
+                       if strict_scintillation else MAX_EPOCHS)
+        if len(epochs) > epoch_limit:
             raise RejectedContentError(
-                f"more than {MAX_EPOCHS} epochs not supported", FILE, ln)
+                f"more than {epoch_limit} epochs not supported", FILE, ln)
     if not epochs:
         raise RinexParseError("no epochs found", FILE, len(lines))
+    if strict_scintillation:
+        all_prns = {prn for epoch in epochs for prn in epoch.obs}
+        if len(all_prns) > SCINTILLATION_MAX_SATELLITES:
+            raise RejectedContentError(
+                f"more than {SCINTILLATION_MAX_SATELLITES} GPS satellites "
+                f"not supported ({len(all_prns)} found)", FILE, n_header + 1)
+        nominal_us = int(round(SCINTILLATION_INTERVAL_S * 1e6))
+        tolerance_us = int(round(TIME_TOLERANCE_S * 1e6))
+        for prev, cur in zip(epochs, epochs[1:]):
+            delta = cur.time - prev.time
+            delta_us = ((delta.days * 86400 + delta.seconds) * 1_000_000
+                        + delta.microseconds)
+            if delta_us <= 0:
+                raise RejectedContentError("epoch times must be strictly increasing",
+                                           FILE, 0)
+            steps = int(round(delta_us / nominal_us))
+            if steps < 1 or abs(delta_us - steps * nominal_us) > tolerance_us:
+                raise RejectedContentError(
+                    f"epoch time difference {(cur.time - prev.time).total_seconds():.6f} s "
+                    f"is not an integer multiple of {SCINTILLATION_INTERVAL_S:.2f} s "
+                    "within 1 us", FILE, 0)
     return RinexData(epochs=epochs, approx_position=approx, obs_types_gps=obs_types)

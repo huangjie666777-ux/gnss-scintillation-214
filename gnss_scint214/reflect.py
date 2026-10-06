@@ -184,7 +184,14 @@ def _invert_arc(arc: list[_Sample], h_grid: np.ndarray) -> dict:
 
 
 def build_grid(h_min: float, h_max: float, h_step: float) -> np.ndarray:
-    n = int(math.floor((h_max - h_min) / h_step)) + 1
+    # Include a mathematically legal upper-bound node when floating-point
+    # division lands just below an integer (e.g. 8.0 - 1.0) / 0.005).
+    quotient = (h_max - h_min) / h_step
+    n_int = int(round(quotient))
+    if abs(quotient - n_int) <= 1e-10:
+        n = n_int + 1
+    else:
+        n = int(math.floor(quotient)) + 1
     return h_min + h_step * np.arange(n)
 
 

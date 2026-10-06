@@ -10,6 +10,8 @@
 - /reflectometry — 单频（S1C，L1 C/A 信噪比）GNSS-IR 反射测高：
   由干涉振荡反演天线相位中心下方反射面高度 H，结合天线相位中心相对
   水尺零点高程 Z 输出水位 Z - H。
+- /scintillation — GPS L1 幅度/相位闪烁监测：上传 S1C/L1C 的 50 Hz
+  RINEX 3.04，逐 GPS 整分输出 60 秒 S4 与 sigma_phi；不需要 SP3。
 
 ## 环境
 
@@ -43,6 +45,11 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 
 合成样例真值：H=3.6 m、Z=12.0 m，已知水位 8.4 m。
 
+闪烁监测（仅 RINEX；样例 4 颗 GPS、18000 个 0.02 s 历元、360 秒）：
+
+    curl -s -F "rinex=@examples/obs_scint.rnx" \
+         http://127.0.0.1:8000/scintillation | python3 -m json.tool
+
 返回每个历元：状态与失败原因、ECEF 米坐标、WGS84 经纬度与椭球高、
 接收机钟差（秒）、使用/排除的卫星（含排除原因）、逐星残差（米）与 RMS。
 
@@ -50,6 +57,7 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 
     .venv/bin/python examples/make_synthetic.py   # 写 examples/obs.rnx, examples/eph.sp3
     .venv/bin/python examples/make_reflect.py     # 写 examples/obs_reflect.rnx（仅 S1C）
+    .venv/bin/python examples/make_scintillation.py # 写 examples/obs_scint.rnx（S1C/L1C, 50Hz）
 
 ## 测试
 
@@ -121,6 +129,26 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
   （起止时间、升/落方向、样本来源 S1C 与样本列表、反射高度 H、
   水位 Z-H、幅值、残差 RMS、RSS 高度曲线与警告）。
 
+## GNSS 闪烁监测规则
+
+- `/scintillation` 使用独立的严格 RINEX 模式：必须有 `INTERVAL   0.020 s`
+  与 GPS 时间，历元严格递增，时差必须是 0.02 s 的整数倍且容差 1 μs；
+  最多 18000 历元、4 颗 GPS 卫星。现有 `/position`、`/tec`、
+  `/reflectometry` 仍保留 100 历元限制。
+- 头部可只声明 `S1C` 与 `L1C`；逐星遇到缺 S1C、缺 L1C、L1C LLI 非零，
+  或相邻观测因缺测而不连续时断弧。异常历元保留在质量记录和窗口失败原因中，
+  不补样。
+- L1C 按连续相位周数处理，不取模、不做 unwrap；每弧先减首相位，再乘 2π
+  转为弧度。滤波器为 6 阶、截止频率 0.1 Hz 的 Butterworth 高通，50 Hz 采样，
+  使用 SciPy SOS 因果滤波、零初态；每弧重置，弧内跨分钟持续保持状态。
+- 以 GPS 整分为起点输出 `[minute, minute+60s)` 半开窗口。有效窗必须有完整
+  3000 个样本、全部属于同一弧，并且窗口起点距弧起点至少 60 秒。缺测、跨弧、
+  尾窗不完整和滤波热身不足均返回 `failed` 与具体原因。
+- S1C 通过 `10^(S1C/10)` 转为信号强度；S4 为窗内总体标准差除以均值。
+  sigma_phi 为高通后相位的窗内总体标准差，单位 rad。
+- 指标只反映观测到的幅度与相位波动，未作接收机/环境噪声修正，也不会自动认定
+  接收机、卫星或信号发生故障。
+
 ## 模块划分
 
 - gnss_scint214/rinex.py — RINEX 3.04 解析与校验
@@ -130,5 +158,7 @@ TEC 监测（站点 WGS84 经纬高 + 逐星合并码偏差 JSON，单位 ns）�
 - gnss_scint214/tec.py — 双频几何无关组合、分弧定级、薄壳映射与穿刺点
 - gnss_scint214/reflect.py — S1C 反射测高：ENU 仰角过滤、单调分弧、
   去趋势与网格搜索反演
+- gnss_scint214/scintillation.py — S1C/L1C 质量分弧、逐弧零初态因果高通
+  滤波与 60 秒闪烁窗口交付
 - gnss_scint214/geodesy.py — WGS84 坐标转换与常数
 - gnss_scint214/main.py — FastAPI 入口
